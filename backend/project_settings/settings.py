@@ -5,6 +5,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY=os.getenv('DJANGO_SECRET_KEY','123')
 DEBUG=os.getenv('DJANGO_DEBUG','1')=='1'
 ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,web').split(',')
+MEDIA_HOST = os.getenv('DJANGO_MEDIA_HOST', 'http://localhost:8000')
+
 
 
 INSTALLED_APPS=[

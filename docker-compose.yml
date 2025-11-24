@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   db:
     image: postgres:14
@@ -10,17 +11,25 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
     networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telecom -d telecom"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   web:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: ["/bin/bash","/app/entrypoint.sh","gunicorn","project_settings.wsgi:application","--bind","0.0.0.0:8000"]
+    entrypoint: ["/bin/bash", "/app/entrypoint_web.sh"]
+    command: ["gunicorn", "project_settings.wsgi:application", "--bind", "0.0.0.0:8000"]
     volumes:
       - ./backend:/app
       - media_data:/app/media
     env_file: [.env]
-    depends_on: [db]
+    depends_on:
+      db:
+        condition: service_healthy
     ports: ["8000:8000"]
     networks: [backend]
 
@@ -28,11 +37,12 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: ["/bin/bash","/app/entrypoint.sh","python","telegram_bot/bot.py"]
+    entrypoint: ["/bin/bash", "/app/entrypoint_bot.sh"]
+    command: ["python", "telegram_bot/bot.py"]
     volumes:
       - ./backend:/app
     env_file: [.env]
-    depends_on: [web, db]
+    depends_on: [db, web]
     networks: [backend]
 
 volumes:

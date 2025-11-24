@@ -5,3 +5,4 @@ gunicorn
 aiogram
 python-dotenv
 requests
+httpx>=0.25.0

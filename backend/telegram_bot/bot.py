@@ -1,109 +1,161 @@
-import logging
 import os
-import requests
-import io
+import logging
 import asyncio
+import httpx
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.filters import Command
-from aiogram.types import InputFile
+from aiogram.exceptions import TelegramAPIError
 
+# --- Настройки ---
 API = os.getenv("API_BASE", "http://web:8000/api")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")  # базовый адрес для медиа
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан!")
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# /start
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+# --- Вспомогательные функции ---
+
+def build_keyboard(items, parent_id=None):
+    buttons = []
+
+    for item in items:
+        if item["type"] == "cat":
+            buttons.append([InlineKeyboardButton(
+                text=f"📁 {item['name']}",
+                callback_data=f"cat:{item['id']}"
+            )])
+        elif item["type"] == "doc":
+            buttons.append([InlineKeyboardButton(
+                text=f"📄 {item['title']}",
+                callback_data=f"doc:{item['id']}:{parent_id if parent_id is not None else 'None'}"
+            )])
+
+    nav_buttons = []
+    if parent_id is not None:
+        nav_buttons.append(InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"cat:{parent_id}"
+        ))
+    nav_buttons.append(InlineKeyboardButton(
+        text="🏠 Главная",
+        callback_data="home"
+    ))
+
+    if nav_buttons:
+        buttons.append(nav_buttons)
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def fetch_json(client, url):
+    resp = await client.get(url)
+    resp.raise_for_status()
+    return resp.json()
+
+async def fetch_file(client, url):
+    resp = await client.get(url)
+    resp.raise_for_status()
+    return resp.content
+
+# --- Хэндлеры ---
+
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    r = requests.get(f"{API}/catalog/")
-    r.raise_for_status()
-    cats = r.json()
+    async with httpx.AsyncClient() as client:
+        cats = await fetch_json(client, f"{API}/catalog/")
 
-    buttons = [
-        [InlineKeyboardButton(text=f"📁 {c['name']}", callback_data=f"cat:{c['id']}")]
-        for c in cats
-    ]
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    items = [{"type": "cat", "id": c["id"], "name": c["name"]} for c in cats]
+    kb = build_keyboard(items)
     await message.answer("Выберите категорию:", reply_markup=kb)
 
-# Категории
 @dp.callback_query(lambda c: c.data.startswith("cat:"))
 async def open_cat(callback: types.CallbackQuery):
     cat_id = callback.data.split(":")[1]
-    r = requests.get(f"{API}/catalog/{cat_id}/")
-    r.raise_for_status()
-    cat = r.json()
 
-    buttons = []
+    async with httpx.AsyncClient() as client:
+        cat = await fetch_json(client, f"{API}/catalog/{cat_id}/")
 
+    items = []
     for ch in cat.get("children", []):
-        buttons.append([InlineKeyboardButton(text=f"📁 {ch['name']}", callback_data=f"cat:{ch['id']}")])
-
+        items.append({"type": "cat", "id": ch["id"], "name": ch["name"]})
     for d in cat.get("documents", []):
-        buttons.append([InlineKeyboardButton(text=f"📄 {d['title']}", callback_data=f"doc:{d['id']}")])
+        items.append({"type": "doc", "id": d["id"], "title": d["title"]})
 
-    if not buttons:
-        await callback.answer("Нет подкатегорий или документов")
-        return
+    kb = build_keyboard(items, parent_id=cat.get("parent"))
 
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(text=f"Раздел: {cat['name']}", reply_markup=kb)
+    try:
+        await callback.message.edit_text(f"Раздел: {cat['name']}", reply_markup=kb)
+    except TelegramAPIError as e:
+        if "message is not modified" not in str(e):
+            raise
     await callback.answer()
 
-# Документы
+@dp.callback_query(lambda c: c.data == "home")
+async def go_home(callback: types.CallbackQuery):
+    async with httpx.AsyncClient() as client:
+        cats = await fetch_json(client, f"{API}/catalog/")
+
+    items = [{"type": "cat", "id": c["id"], "name": c["name"]} for c in cats]
+    kb = build_keyboard(items)
+
+    try:
+        await callback.message.edit_text("Выберите категорию:", reply_markup=kb)
+    except TelegramAPIError as e:
+        if "message is not modified" not in str(e):
+            raise
+    await callback.answer()
+
 @dp.callback_query(lambda c: c.data.startswith("doc:"))
 async def open_doc(callback: types.CallbackQuery):
-    doc_id = callback.data.split(":")[1]
+    # Получаем id документа и parent_id категории
+    doc_id, _ = callback.data.split(":")[1:3]
 
-    try:
-        r = requests.get(f"{API}/documents/{doc_id}/")
-        r.raise_for_status()
-        doc = r.json()
-    except requests.RequestException as e:
-        await callback.answer(f"Ошибка при получении документа", show_alert=True)
-        return
+    async with httpx.AsyncClient() as client:
+        # Получаем метаданные документа
+        doc = await fetch_json(client, f"{API}/documents/{doc_id}/")
+        file_path = doc.get("file")
+        if not file_path:
+            await callback.answer("Файл не найден", show_alert=True)
+            return
+        
+        # Используем категорию документа для кнопки "Назад"
+        parent_id = doc.get("category")
 
-    if "file" not in doc or not doc["file"]:
-        await callback.answer("Файл не найден", show_alert=True)
-        return
+        # Формируем корректный URL для скачивания
+        file_url = f"{BASE_URL}/{file_path.lstrip('/')}" if not file_path.startswith(("http://", "https://")) else file_path
+        file_content = await fetch_file(client, file_url)
 
-    # URL файла
-    file_path = doc["file"]
-    if file_path.startswith("/"):
-        file_url = f"{BASE_URL}{file_path}"
-    else:
-        file_url = f"{BASE_URL}/{file_path}"
-
-    try:
-        file_resp = requests.get(file_url)
-        file_resp.raise_for_status()
-    except requests.RequestException:
-        # Если не удалось скачать файл, просто даём ссылку
-        await callback.message.answer(f"Не удалось скачать файл. Ссылка для скачивания: {file_url}")
+    # Проверка размера
+    if len(file_content) > MAX_FILE_SIZE:
+        await callback.message.answer(f"Файл слишком большой. Ссылка: {file_url}")
         await callback.answer()
         return
 
-    # Ограничение Telegram на файлы
-    MAX_FILE_SIZE = 50 * 1024 * 1024
-    if len(file_resp.content) > MAX_FILE_SIZE:
-        await callback.message.answer(f"Файл слишком большой для Telegram. Ссылка: {file_url}")
-        await callback.answer()
-        return
+    # Отправляем файл отдельным сообщением
+    input_file = BufferedInputFile(file_content, os.path.basename(file_path))
+    await callback.message.answer_document(input_file)
 
-    # Отправляем файл
-    filename = os.path.basename(file_path)
-    input_file = InputFile.from_buffer(file_resp.content, filename=filename)
-    await callback.message.answer_document(document=input_file)
+    # Обновляем кнопки навигации в том же сообщении
+    kb = build_keyboard([], parent_id=parent_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except TelegramAPIError as e:
+        # Игнорируем ошибку "message is not modified"
+        if "message is not modified" not in str(e):
+            raise
+
     await callback.answer()
 
 
-
+# --- Запуск ---
 
 async def main():
     logging.info("Start polling")
